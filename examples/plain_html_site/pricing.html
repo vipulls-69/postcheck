@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Plain HTML Site — Pricing</title>
+    <link rel="stylesheet" href="./shared.css" />
+  </head>
+  <body>
+    <nav>
+      <a href="./index.html">Home</a>
+      <a href="./about.html">About</a>
+      <a href="./pricing.html">Pricing</a>
+    </nav>
+    <main>
+      <h1>Pricing</h1>
+      <button
+        id="pricing-action"
+        data-testid="pricing-action"
+        onclick="onPricingClick()"
+      >
+        Get quote
+      </button>
+      <p id="pricing-output"></p>
+    </main>
+    <script src="./shared.js"></script>
+  </body>
+</html>

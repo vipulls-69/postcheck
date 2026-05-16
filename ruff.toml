@@ -1,0 +1,39 @@
+target-version = "py311"
+line-length = 100
+src = ["postcheck", "tests"]
+
+[lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "N",    # pep8-naming
+    "S",    # flake8-bandit
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+    "ASYNC",
+    "T20",  # no print
+    "ANN",  # annotations
+    "PTH",  # use pathlib
+    "TCH",  # type-checking
+]
+ignore = [
+    "ANN101",  # missing type annotation for self
+    "ANN102",  # missing type annotation for cls
+    "S101",    # assert (allowed in tests)
+]
+
+[lint.per-file-ignores]
+"tests/**" = ["S101", "ANN", "T20"]
+"postcheck/hooks/*" = ["T20"]
+
+[lint.isort]
+required-imports = ["from __future__ import annotations"]
+
+[format]
+quote-style = "double"
+indent-style = "space"

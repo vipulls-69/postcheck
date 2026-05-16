@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Plain HTML Site — About</title>
+    <link rel="stylesheet" href="./shared.css" />
+  </head>
+  <body>
+    <nav>
+      <a href="./index.html">Home</a>
+      <a href="./about.html">About</a>
+      <a href="./pricing.html">Pricing</a>
+    </nav>
+    <main>
+      <h1>About</h1>
+      <button
+        id="about-action"
+        data-testid="about-action"
+        onclick="onAboutClick()"
+      >
+        Show info
+      </button>
+      <p id="about-output"></p>
+    </main>
+    <script src="./shared.js"></script>
+  </body>
+</html>
