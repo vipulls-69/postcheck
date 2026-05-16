@@ -38,7 +38,7 @@ from typer.testing import CliRunner
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEMO_SRC = REPO_ROOT / "examples" / "demo_ecommerce"
-DEV_HOST = "127.0.0.1"
+DEV_HOST = "localhost"
 DEV_PORT = 5173
 DEV_URL = f"http://{DEV_HOST}:{DEV_PORT}"
 VERIFY_BUDGET_SECONDS = 30.0
@@ -469,6 +469,7 @@ def test_runs_list_and_show(
     demo_workspace: Workspace,
     clean_verify: tuple[int, dict, str, float],
     buggy_verify: tuple[int, dict, str, float],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`postcheck runs list` shows the persisted runs; `runs show <prefix>` works."""
     # NOTE: user spec asks for ">= 4 runs"; our optimised fixtures produce 2
@@ -476,8 +477,11 @@ def test_runs_list_and_show(
     _ = clean_verify, buggy_verify
     from postcheck.cli.main import app
 
+    # `runs list/show` locate the DB via cwd's walked-up .postcheck/ — chdir
+    # into the project so we hit the demo's DB rather than any ambient one.
+    monkeypatch.chdir(demo_workspace.root)
     runner = CliRunner()
-    result = runner.invoke(app, ["runs", "list", "--project", str(demo_workspace.root)])
+    result = runner.invoke(app, ["runs", "list"])
     assert result.exit_code == 0, result.output
     lines = [ln for ln in result.output.splitlines() if ln.strip()]
     # Strip header + separator rows; count data rows by looking for our statuses.
@@ -498,7 +502,7 @@ def test_runs_list_and_show(
 
     show = runner.invoke(
         app,
-        ["runs", "show", short_id, "--project", str(demo_workspace.root)],
+        ["runs", "show", short_id],
     )
     assert show.exit_code == 0, show.output
     # Either a Markdown report or a "no bugs" message — both are acceptable.

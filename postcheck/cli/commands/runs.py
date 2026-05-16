@@ -209,11 +209,11 @@ def list_cmd(
     ),
 ) -> None:
     """List recent verification runs."""
-    project_root = _require_project_root(None)
-
     if all_projects and project is not None:
         typer.echo("error: --all and --project are mutually exclusive", err=True)
         raise typer.Exit(code=3)
+
+    project_root = _require_project_root(None)
 
     project_filter: Path | None
     if all_projects:

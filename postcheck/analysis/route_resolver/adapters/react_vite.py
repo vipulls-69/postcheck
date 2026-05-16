@@ -224,6 +224,32 @@ def _attr_expr_value(attr: ts.Node) -> ts.Node | None:
     return None
 
 
+def _attr_template_prefix(attr: ts.Node) -> str | None:
+    """Return the static leading literal of a template-string attribute.
+
+    For ``data-testid={`remove-${id}`}`` returns ``"remove-"``. Returns
+    ``None`` when the attribute is not a template literal or has no
+    non-empty leading literal segment. Used so that template-literal
+    ``data-testid`` values can still seed a useful attribute-prefix CSS
+    selector candidate.
+    """
+    expr = _attr_expr_value(attr)
+    if expr is None or expr.type != "template_string":
+        return None
+    for child in expr.children:
+        if child.type in {"`", "template_substitution"}:
+            # An immediate substitution at the start means no static prefix.
+            if child.type == "template_substitution":
+                return None
+            continue
+        if child.type == "string_fragment":
+            prefix = _text(child)
+            return prefix or None
+        # Any other node shape: bail.
+        return None
+    return None
+
+
 def _join_url(parent: str, child: str) -> str:
     if child.startswith("/"):
         return child
@@ -324,6 +350,7 @@ def _extract_selectors_from_file(
         # Does this element have an onClick or similar handler?
         has_handler = False
         attrs: dict[str, str] = {}
+        testid_prefix: str | None = None
         for attr in _iter_jsx_attrs(node):
             name = _attr_name(attr)
             if name.startswith("on") and name[2:3].isupper():
@@ -331,10 +358,18 @@ def _extract_selectors_from_file(
             sval = _attr_string_value(attr)
             if sval is not None:
                 attrs[name] = sval
+            elif name == "data-testid":
+                # Template literal — capture its static prefix for a
+                # ``[data-testid^="…"]`` candidate below.
+                testid_prefix = _attr_template_prefix(attr)
         if not has_handler:
             continue
         if "data-testid" in attrs:
             candidates.append(Selector(strategy="test_id", value=attrs["data-testid"]))
+        elif testid_prefix:
+            candidates.append(
+                Selector(strategy="css", value=f'[data-testid^="{testid_prefix}"]')
+            )
         if "role" in attrs and "aria-label" in attrs:
             candidates.append(
                 Selector(strategy="role", value=f"{attrs['role']}:{attrs['aria-label']}")
