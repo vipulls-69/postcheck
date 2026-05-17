@@ -114,7 +114,16 @@ def _target(loc: StubLocator) -> LocatedTarget:
 
 
 def _cfg(**overrides) -> ScenarioRunConfig:
-    base = {"route": "/r", "url": "http://x/r", "settle_ms": 0}
+    # Unit tests use a StubPage that doesn't model ``page.reload``; default
+    # to ``recovery_mode="never"`` so legacy assertions about exact event
+    # sequences hold. Real-browser recovery is covered by the integration
+    # tests in ``tests/integration/test_scenario_runner.py``.
+    base = {
+        "route": "/r",
+        "url": "http://x/r",
+        "settle_ms": 0,
+        "recovery_mode": "never",
+    }
     base.update(overrides)
     return ScenarioRunConfig(**base)
 
@@ -198,10 +207,15 @@ async def test_events_carry_correct_interaction_index():
     )
 
     drains = [e for e in events if e.payload["label"] == "drain"]
-    # Three drains: post-navigate (no index), after b1 (idx=0), after b2 (idx=1),
-    # plus a trailing drain (no index).
+    # Six drains: post-navigate (no index), after b1 (idx=0), after b2
+    # (idx=1), trailing drain after the loop (no index), a post-grace
+    # drain (no index) that picks up any requests that resolved during
+    # the detach grace window, and a final post-detach drain (no index)
+    # so probes that synthesise events during ``detach`` (network
+    # probe's in-flight-request synthesis) don't get their events
+    # dropped on the floor.
     indices = [e.interaction_index for e in drains]
-    assert indices == [None, 0, 1, None]
+    assert indices == [None, 0, 1, None, None, None]
 
 
 # ---------------------------------------------------------------------------

@@ -190,11 +190,25 @@ async def run_verification(opts: VerifyOptions) -> VerifyResult:
     # errors) come first so the report leads with execution-level issues.
     bugs: list[Bug] = []
     bugs.extend(pre_aggregate_bugs)
+    # Route -> changed files that actually load on that route. Derived
+    # from the impact mapper's ``AffectedRoute.changed_symbols`` (each
+    # ``Symbol.file`` is, by construction, a file the adapter said is
+    # served by this route). Scopes ``suspected_location`` so a bug
+    # fired on ``/network`` can't be attributed to a handler that only
+    # renders on ``/interactions``.
+    route_files: dict[str, list[Path]] = {}
+    for ar in affected:
+        seen: list[Path] = []
+        for sym in ar.changed_symbols:
+            if sym.file not in seen:
+                seen.append(sym.file)
+        route_files[ar.route] = seen
     bugs.extend(
         aggregate_bugs(
             events,
             file_changes=file_changes,
             symbol_changes=symbol_changes,
+            route_files=route_files,
         )
     )
 
@@ -283,6 +297,9 @@ async def _run_one_route(
             route=route,
             url=url,
             timeout_ms=settings.timeout_ms,
+            recovery_mode=settings.scenario.recovery_mode,
+            detach_grace_ms=settings.scenario.detach_grace_ms,
+            detach_poll_ms=settings.scenario.detach_poll_ms,
         )
         events = await run_scenario(page, located.targets, probes, config=cfg)
     except CDPAttachError:

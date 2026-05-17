@@ -130,10 +130,103 @@ async def test_runtime_probe_captures_click_triggered_error(tmp_path: Path) -> N
     assert pageerror.interaction_index == 0  # the "explode" click
     assert pageerror.route == "/index.html"
 
-    # The second click logged a console error.
-    console_errs = [e for e in errors if e.payload.get("source") == "console"]
+    # The second click logged a console error — now split into its own
+    # ``runtime_console_error`` kind so it ranks below uncaught throws.
+    console_errs = by_kind.get("runtime_console_error", [])
     assert console_errs, f"no console error captured; got {runtime_events!r}"
     assert any(
         "console error from click" in e.payload["message"] for e in console_errs
     )
     assert any(e.interaction_index == 1 for e in console_errs)
+
+
+# ---------------------------------------------------------------------------
+# ISSUE C regression coverage: ``console.error`` / ``console.warn`` get
+# their own distinct kinds (``runtime_console_error`` /
+# ``runtime_console_warning``) so the bug aggregator ranks them below
+# uncaught ``pageerror`` throws. Driven via ``page.evaluate`` so we don't
+# depend on click instrumentation.
+# ---------------------------------------------------------------------------
+
+
+async def test_console_error_from_handler_caught(tmp_path: Path) -> None:
+    """A direct ``console.error`` call from page code surfaces as a
+    ``ProbeEvent`` with ``payload.kind == 'runtime_console_error'`` \u2014
+    *not* ``runtime_error`` (which is reserved for uncaught throws).
+    """
+    from playwright.async_api import async_playwright
+
+    (tmp_path / "blank.html").write_text(
+        "<!doctype html><html><body></body></html>", encoding="utf-8"
+    )
+
+    async with _serve(tmp_path) as base_url:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch()
+            try:
+                context = await browser.new_context()
+                page = await context.new_page()
+
+                probe = RuntimeProbe()
+                await probe.attach(page)
+                await page.goto(f"{base_url}/blank.html", wait_until="load")
+                # ``console.error`` from app code \u2014 the canonical test.
+                await page.evaluate("console.error('hello from evaluate')")
+                # Console events fire on the next microtask; a tiny eval
+                # round-trip is enough to flush them to Python.
+                await page.evaluate("1")
+
+                events = probe.collect_events()
+            finally:
+                await browser.close()
+
+    console_errs = [
+        e for e in events
+        if e.payload.get("kind") == "runtime_console_error"
+    ]
+    assert console_errs, [e.payload for e in events]
+    assert any(
+        "hello from evaluate" in e.payload.get("message", "")
+        for e in console_errs
+    )
+    # And critically: NOT classified as the uncaught-throw bucket.
+    assert not any(
+        e.payload.get("kind") == "runtime_error" for e in events
+    ), [e.payload for e in events]
+
+
+async def test_console_warning_caught_at_warning_level(tmp_path: Path) -> None:
+    """``console.warn`` becomes ``runtime_console_warning`` \u2014 the lowest
+    runtime severity bucket.
+    """
+    from playwright.async_api import async_playwright
+
+    (tmp_path / "blank.html").write_text(
+        "<!doctype html><html><body></body></html>", encoding="utf-8"
+    )
+
+    async with _serve(tmp_path) as base_url:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch()
+            try:
+                context = await browser.new_context()
+                page = await context.new_page()
+
+                probe = RuntimeProbe()
+                await probe.attach(page)
+                await page.goto(f"{base_url}/blank.html", wait_until="load")
+                await page.evaluate("console.warn('careful now')")
+                await page.evaluate("1")
+
+                events = probe.collect_events()
+            finally:
+                await browser.close()
+
+    warns = [
+        e for e in events
+        if e.payload.get("kind") == "runtime_console_warning"
+    ]
+    assert warns, [e.payload for e in events]
+    assert any(
+        "careful now" in e.payload.get("message", "") for e in warns
+    )

@@ -43,9 +43,15 @@ class StubPage:
     pass
 
 
-def _target(test_id: str = "btn") -> LocatedTarget:
+def _target(
+    test_id: str = "btn", *, expected_visible_effect: bool | None = None
+) -> LocatedTarget:
     return LocatedTarget(
-        selector=Selector(strategy="test_id", value=test_id),
+        selector=Selector(
+            strategy="test_id",
+            value=test_id,
+            expected_visible_effect=expected_visible_effect,
+        ),
         locator=StubLocator(),  # type: ignore[arg-type]
     )
 
@@ -116,7 +122,16 @@ async def test_no_change_emitted_when_dom_unchanged():
     assert event.payload["selector"]["value"] == "btn"
 
 
-async def test_no_change_not_emitted_when_target_outer_html_changed():
+async def test_no_change_emitted_even_when_target_outer_html_changed():
+    """Target ``outerHTML`` is intentionally *not* part of the route-window
+    diff (ISSUE A fix). Many real handlers update a sibling element (e.g.
+    ``setMsg(...)`` writing to a ``<p data-testid="*-msg">``); the clicked
+    button's HTML stays identical and the route window's three metrics
+    are what decide whether the interaction had a visible effect. A
+    target-only HTML change with an unchanged route window must therefore
+    still emit ``ui_no_change`` (at heuristic confidence, since the stub
+    selector has no ``expected_visible_effect`` hint).
+    """
     probe = DomAssertionsProbe()
     await probe.attach(StubPage())  # type: ignore[arg-type]
     target = _target()
@@ -125,7 +140,10 @@ async def test_no_change_not_emitted_when_target_outer_html_changed():
     )
     await probe.before_interaction(0, target)
     await probe.after_interaction(0, target)
-    assert [e for e in probe.collect_events() if e.payload["kind"] == "ui_no_change"] == []
+    events = [e for e in probe.collect_events() if e.payload["kind"] == "ui_no_change"]
+    assert len(events) == 1
+    assert events[0].payload["confidence"] == "heuristic"
+    assert events[0].payload["target_outer_html_unchanged"] is False
 
 
 async def test_no_change_not_emitted_when_body_text_changed():
@@ -162,6 +180,97 @@ async def test_no_change_not_emitted_when_target_disappeared():
     await probe.before_interaction(0, target)
     await probe.after_interaction(0, target)
     assert probe.collect_events() == []
+
+
+# ---------------------------------------------------------------------------
+# ISSUE A — route-window snapshot + expected_visible_effect grading
+# ---------------------------------------------------------------------------
+
+
+async def test_setMsg_update_does_not_trigger_no_change():
+    """A handler that updates a sibling ``<p>`` (the ``setMsg`` pattern)
+    moves the route window's text — even though the clicked button's
+    own ``outerHTML`` is unchanged. No ``ui_no_change`` should fire.
+    """
+    probe = DomAssertionsProbe()
+    await probe.attach(StubPage())  # type: ignore[arg-type]
+    target = _target(expected_visible_effect=True)
+    # ``outerHTML`` stays identical (the button didn't change); the
+    # route-window text length changes because a sibling <p> received
+    # the new message.
+    target.locator.queue(_snap(text_length=42, child_count=10, text_hash=1)).queue(  # type: ignore[attr-defined]
+        _snap(text_length=58, child_count=10, text_hash=2)
+    )
+    await probe.before_interaction(0, target)
+    await probe.after_interaction(0, target)
+    no_change = [
+        e for e in probe.collect_events()
+        if e.payload["kind"] == "ui_no_change"
+    ]
+    assert no_change == []
+
+
+async def test_truly_noop_handler_emits_ui_no_change():
+    """A handler that is literally ``() => {}`` leaves the route window
+    byte-identical; ``ui_no_change`` must fire. When the adapter is
+    confident (``expected_visible_effect=True``) the finding ships at
+    ``deterministic`` confidence.
+    """
+    probe = DomAssertionsProbe()
+    await probe.attach(StubPage())  # type: ignore[arg-type]
+    target = _target(expected_visible_effect=True)
+    snap = _snap(text_length=42, child_count=10, text_hash=1)
+    target.locator.queue(snap).queue(snap)  # type: ignore[attr-defined]
+    await probe.before_interaction(0, target)
+    await probe.after_interaction(0, target)
+    [event] = [
+        e for e in probe.collect_events()
+        if e.payload["kind"] == "ui_no_change"
+    ]
+    assert event.payload["confidence"] == "deterministic"
+    assert event.payload["expected_visible_effect"] is True
+
+
+async def test_no_state_change_intent_emits_heuristic_confidence():
+    """When the adapter could not predict the handler's intent
+    (``expected_visible_effect=None``, e.g. handler body was a bare
+    ``console.log`` we couldn't classify), ``ui_no_change`` still
+    surfaces — but at ``heuristic`` confidence so consumers can rank it
+    below cases where we *know* a visible effect was expected.
+    """
+    probe = DomAssertionsProbe()
+    await probe.attach(StubPage())  # type: ignore[arg-type]
+    target = _target(expected_visible_effect=None)
+    snap = _snap(text_length=42, child_count=10, text_hash=1)
+    target.locator.queue(snap).queue(snap)  # type: ignore[attr-defined]
+    await probe.before_interaction(0, target)
+    await probe.after_interaction(0, target)
+    [event] = [
+        e for e in probe.collect_events()
+        if e.payload["kind"] == "ui_no_change"
+    ]
+    assert event.payload["confidence"] == "heuristic"
+    assert event.payload.get("expected_visible_effect") is None
+
+
+async def test_expected_visible_effect_false_suppresses_no_change():
+    """When the adapter is confident the handler has no visible effect
+    (``expected_visible_effect=False`` — handler body was a bare
+    analytics / fire-and-forget fetch), the probe must suppress
+    ``ui_no_change`` entirely. Surfacing it would be pure noise.
+    """
+    probe = DomAssertionsProbe()
+    await probe.attach(StubPage())  # type: ignore[arg-type]
+    target = _target(expected_visible_effect=False)
+    snap = _snap(text_length=42, child_count=10, text_hash=1)
+    target.locator.queue(snap).queue(snap)  # type: ignore[attr-defined]
+    await probe.before_interaction(0, target)
+    await probe.after_interaction(0, target)
+    no_change = [
+        e for e in probe.collect_events()
+        if e.payload["kind"] == "ui_no_change"
+    ]
+    assert no_change == []
 
 
 # ---------------------------------------------------------------------------

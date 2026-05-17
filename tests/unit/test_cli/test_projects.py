@@ -162,7 +162,8 @@ def _seed_with_run(initialised: Path) -> str:
                             "probe": "runtime",
                             "route": "/",
                             "confidence": "deterministic",
-                            "error_message": "x",
+                            "title": "x",
+                            "detail": "",
                         }
                     ],
                 )

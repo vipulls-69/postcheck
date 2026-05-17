@@ -26,7 +26,7 @@ async def test_init_db_runs_migrations_to_head(tmp_path: Path) -> None:
         )}
         assert {"organization", "project", "run", "bug", "alembic_version"} <= tables
         version = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-        assert version == "0001_initial_schema"
+        assert version == "0002_bug_split_message"
     finally:
         conn.close()
 
@@ -40,7 +40,7 @@ async def test_init_db_is_idempotent(tmp_path: Path) -> None:
     conn = sqlite3.connect(db_path_2)
     try:
         version = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-        assert version == "0001_initial_schema"
+        assert version == "0002_bug_split_message"
     finally:
         conn.close()
     # File still exists (might or might not have been touched — only checking no error).

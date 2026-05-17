@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
 from ..core.types import (
@@ -39,6 +40,11 @@ from ..core.types import (
     Interaction,
     ProbeEvent,
     SymbolChange,
+)
+from ..probes.shared import (
+    format_network_message,
+    format_runtime_message,
+    format_storage_message,
 )
 
 
@@ -60,11 +66,43 @@ _RECIPES: dict[str, _BugRecipe] = {
     # runtime_probe
     "runtime_error": _BugRecipe("high", "deterministic", "Runtime error"),
     "runtime_warning": _BugRecipe("low", "heuristic", "Console warning"),
+    # ``console.error`` / ``console.warn`` — split from ``runtime_error``
+    # because a logged-and-handled error is meaningfully less severe
+    # than an uncaught throw (which crashes the surrounding call frame).
+    "runtime_console_error": _BugRecipe(
+        "medium", "heuristic", "Console error"
+    ),
+    "runtime_console_warning": _BugRecipe(
+        "low", "heuristic", "Console warning"
+    ),
     "page_crash": _BugRecipe("critical", "deterministic", "Page crashed"),
     # network_probe
     "network_error": _BugRecipe("high", "deterministic", "Network error"),
     "navigation_failure": _BugRecipe(
         "critical", "deterministic", "Navigation failed"
+    ),
+    # ``net::ERR_*`` splits — see ``_classify_failure`` in network_probe.
+    # A ``network_aborted`` comes out of Chromium's ``ERR_ABORTED`` —
+    # the request *definitely* failed; only the cause is ambiguous
+    # (user navigation, AbortController, devtools cancel). Hence
+    # ``deterministic``. ``network_unresolved_at_detach`` is the
+    # heuristic backstop synthesised by the probe on teardown for
+    # requests that never produced any terminal event in the scenario
+    # window — most often a slow server, *not* an abort.
+    "network_aborted": _BugRecipe(
+        "low", "deterministic", "Network request aborted"
+    ),
+    "network_unresolved_at_detach": _BugRecipe(
+        "low", "heuristic", "Network request did not resolve"
+    ),
+    "network_timeout": _BugRecipe(
+        "high", "deterministic", "Network request timed out"
+    ),
+    "network_dns_error": _BugRecipe(
+        "high", "deterministic", "DNS resolution failed"
+    ),
+    "network_connection_error": _BugRecipe(
+        "high", "deterministic", "Network connection failed"
     ),
     # storage_probe
     "storage_quota_error": _BugRecipe(
@@ -72,6 +110,19 @@ _RECIPES: dict[str, _BugRecipe] = {
     ),
     "storage_serialization_error": _BugRecipe(
         "medium", "deterministic", "Storage serialization failed"
+    ),
+    # IndexedDB — see ``storage_probe`` for the full kind list.
+    "storage_idb_version_error": _BugRecipe(
+        "high", "deterministic", "IndexedDB upgrade failed"
+    ),
+    "storage_idb_quota_error": _BugRecipe(
+        "high", "deterministic", "IndexedDB quota exceeded"
+    ),
+    "storage_idb_blocked": _BugRecipe(
+        "medium", "heuristic", "IndexedDB open blocked"
+    ),
+    "storage_idb_serialization_error": _BugRecipe(
+        "medium", "deterministic", "IndexedDB value not cloneable"
     ),
     # ui_probe
     "ui_no_change": _BugRecipe(
@@ -89,17 +140,24 @@ def aggregate_bugs(
     file_changes: Iterable[FileChange] | None = None,
     symbol_changes: Iterable[SymbolChange] | None = None,
     interactions_by_route: dict[str, list[Interaction]] | None = None,
+    route_files: dict[str, list[Path]] | None = None,
 ) -> list[Bug]:
     """Translate ``events`` into a flat ordered list of :class:`Bug`.
 
     ``file_changes`` and ``symbol_changes`` drive best-effort
     file:line attribution. ``interactions_by_route`` (if supplied)
     populates :attr:`Bug.interaction` so the report can render the
-    triggering action.
+    triggering action. ``route_files`` (route -> changed files
+    belonging to that route, as returned by the adapter's
+    ``files_for_route`` intersected with the diff) scopes
+    ``suspected_location`` to files that actually load on the bug's
+    route — without it, a bug fired on ``/network`` could be attributed
+    to a changed handler that only renders on ``/interactions``.
     """
     file_list = list(file_changes or [])
     symbol_list = list(symbol_changes or [])
     interactions_map = interactions_by_route or {}
+    route_files_map = route_files or {}
     bugs: list[Bug] = []
 
     # Scenario failures map onto a virtual recipe whose severity depends
@@ -107,7 +165,7 @@ def aggregate_bugs(
     # than per-interaction failures.
     for ev in events:
         bug = _event_to_bug(
-            ev, file_list, symbol_list, interactions_map
+            ev, file_list, symbol_list, interactions_map, route_files_map
         )
         if bug is not None:
             bugs.append(bug)
@@ -124,6 +182,7 @@ def _event_to_bug(
     file_changes: list[FileChange],
     symbol_changes: list[SymbolChange],
     interactions_map: dict[str, list[Interaction]],
+    route_files_map: dict[str, list[Path]],
 ) -> Bug | None:
     payload = event.payload or {}
     kind = payload.get("kind") or payload.get("type")
@@ -133,7 +192,9 @@ def _event_to_bug(
         return None
 
     if kind == "scenario_failure":
-        return _scenario_bug(event, file_changes, symbol_changes, interactions_map)
+        return _scenario_bug(
+            event, file_changes, symbol_changes, interactions_map, route_files_map
+        )
 
     recipe = _RECIPES.get(kind)
     if recipe is None:
@@ -141,14 +202,31 @@ def _event_to_bug(
 
     title = _title_for(kind, payload, recipe.title_template)
     detail = _detail_for(kind, payload)
-    location = _suspected_location(payload, file_changes, symbol_changes)
+    location = _suspected_location(
+        payload,
+        _scoped_files(file_changes, route_files_map.get(event.route)),
+        symbol_changes,
+        route_scoped=event.route in route_files_map,
+    )
     interaction = _lookup_interaction(event, interactions_map)
+
+    # Confidence override: ``ui_no_change`` ships at the probe-supplied
+    # confidence when present. The UI probe sets ``deterministic`` when
+    # the adapter predicted a visible effect and the route window stayed
+    # identical (a real defect), and ``heuristic`` when the adapter
+    # could not predict the handler's intent. The recipe default
+    # (``heuristic``) is used when the payload omits the override.
+    confidence: BugConfidence = recipe.confidence
+    if kind == "ui_no_change":
+        override = payload.get("confidence")
+        if override in ("deterministic", "heuristic", "llm_judged"):
+            confidence = override  # type: ignore[assignment]
 
     return Bug(
         probe=event.probe,
         route=event.route,
         severity=recipe.severity,
-        confidence=recipe.confidence,
+        confidence=confidence,
         title=title,
         detail=detail,
         interaction=interaction,
@@ -163,6 +241,7 @@ def _scenario_bug(
     file_changes: list[FileChange],
     symbol_changes: list[SymbolChange],
     interactions_map: dict[str, list[Interaction]],
+    route_files_map: dict[str, list[Path]],
 ) -> Bug:
     payload = event.payload or {}
     phase = str(payload.get("phase", "unknown"))
@@ -179,7 +258,10 @@ def _scenario_bug(
         detail=error,
         interaction=_lookup_interaction(event, interactions_map),
         suspected_location=_suspected_location(
-            payload, file_changes, symbol_changes
+            payload,
+            _scoped_files(file_changes, route_files_map.get(event.route)),
+            symbol_changes,
+            route_scoped=event.route in route_files_map,
         ),
         evidence=dict(payload),
         detected_at=event.timestamp,
@@ -187,26 +269,41 @@ def _scenario_bug(
 
 
 def _title_for(kind: str, payload: dict, template: str) -> str:
-    """Render a one-line headline. Pure string ops — no ``.format`` call."""
-    if kind == "network_error" or kind == "navigation_failure":
-        method = payload.get("method", "GET")
-        url = payload.get("url", "?")
-        status = payload.get("status")
-        if status is not None:
-            return f"{template}: {method} {url} → {status}"
-        err = payload.get("error", "request failed")
-        return f"{template}: {method} {url} ({err})"
-    if kind in {"runtime_error", "runtime_warning"}:
-        msg = payload.get("message") or payload.get("console_type") or "<no message>"
-        return f"{template}: {_truncate(msg, 140)}"
-    if kind == "page_crash":
-        return template
-    if kind == "storage_quota_error":
-        storage = payload.get("storage", "storage")
-        key = payload.get("key", "?")
-        return f"{template} writing {storage}[{key!r}]"
-    if kind == "storage_serialization_error":
-        return f"{template}: {_truncate(payload.get('error', ''), 140)}"
+    """Render a one-line headline. Pure string ops — no ``.format`` call.
+
+    Runtime / network / storage kinds delegate to the shared
+    ``format_*_message`` helpers in :mod:`postcheck.probes.shared`. That
+    keeps formatting in one place — when a probe adds a new event kind,
+    a missing case in the helper trips the formatter's
+    ``"<kind> fired"`` fallback rather than silently rendering an empty
+    title (which is the regression this consolidation guards against).
+    """
+    if kind in {
+        "runtime_error",
+        "runtime_warning",
+        "runtime_console_error",
+        "runtime_console_warning",
+        "page_crash",
+    }:
+        return format_runtime_message(kind, payload)
+    if kind in {
+        "network_error",
+        "navigation_failure",
+        "network_aborted",
+        "network_timeout",
+        "network_dns_error",
+        "network_connection_error",
+    }:
+        return format_network_message(kind, payload)
+    if kind in {
+        "storage_quota_error",
+        "storage_serialization_error",
+        "storage_idb_version_error",
+        "storage_idb_quota_error",
+        "storage_idb_blocked",
+        "storage_idb_serialization_error",
+    }:
+        return format_storage_message(kind, payload)
     if kind in {"ui_no_change", "ui_overlay_blocks"}:
         sel = payload.get("selector") or {}
         sel_value = sel.get("value", "?") if isinstance(sel, dict) else "?"
@@ -217,7 +314,12 @@ def _title_for(kind: str, payload: dict, template: str) -> str:
 def _detail_for(kind: str, payload: dict) -> str:
     """Multi-line detail block, kept short and useful (≤ ~6 lines)."""
     parts: list[str] = []
-    if kind in {"runtime_error", "runtime_warning"}:
+    if kind in {
+        "runtime_error",
+        "runtime_warning",
+        "runtime_console_error",
+        "runtime_console_warning",
+    }:
         if (msg := payload.get("message")):
             parts.append(str(msg))
         if (stack := payload.get("stack")):
@@ -227,19 +329,35 @@ def _detail_for(kind: str, payload: dict) -> str:
             line = loc.get("line")
             if url:
                 parts.append(f"at {url}:{line}" if line else f"at {url}")
-    elif kind in {"network_error", "navigation_failure"}:
+    elif kind in {
+        "network_error",
+        "navigation_failure",
+        "network_aborted",
+        "network_timeout",
+        "network_dns_error",
+        "network_connection_error",
+    }:
         if (err := payload.get("error")):
             parts.append(f"error: {err}")
         if (rt := payload.get("resource_type")):
             parts.append(f"resource_type: {rt}")
         if (cf := payload.get("confidence")):
             parts.append(f"network confidence: {cf}")
-    elif kind == "storage_quota_error":
+    elif kind in {"storage_quota_error", "storage_idb_quota_error"}:
         if (sz := payload.get("attempted_size")) is not None:
             parts.append(f"attempted size: {sz} bytes")
         if (err := payload.get("error")):
             parts.append(str(err))
-    elif kind == "storage_serialization_error":
+    elif kind in {
+        "storage_serialization_error",
+        "storage_idb_version_error",
+        "storage_idb_blocked",
+        "storage_idb_serialization_error",
+    }:
+        if (db := payload.get("database")):
+            parts.append(f"database: {db}")
+        if (store := payload.get("store")):
+            parts.append(f"store: {store}")
         if (err := payload.get("error")):
             parts.append(str(err))
     elif kind == "ui_no_change":
@@ -266,12 +384,49 @@ _FILE_LINE_RE = re.compile(
 )
 
 
+def _scoped_files(
+    file_changes: list[FileChange], allowed: list[Path] | None
+) -> list[FileChange]:
+    """Return the subset of ``file_changes`` whose path is in ``allowed``.
+
+    ``allowed=None`` means "no route scoping known" — caller gets the
+    full list back so behaviour matches the pre-route-scope code path
+    (used by unit tests that don't supply ``route_files``). ``allowed``
+    paths may be project-relative or absolute; we compare by ``str``
+    suffix to handle both.
+    """
+    if allowed is None:
+        return file_changes
+    if not allowed:
+        return []
+    allowed_strs = {str(p) for p in allowed}
+    out: list[FileChange] = []
+    for fc in file_changes:
+        fc_str = str(fc.path)
+        if fc_str in allowed_strs or any(
+            fc_str.endswith(a) or a.endswith(fc_str) for a in allowed_strs
+        ):
+            out.append(fc)
+    return out
+
+
 def _suspected_location(
     payload: dict,
     file_changes: list[FileChange],
     symbol_changes: list[SymbolChange],
+    *,
+    route_scoped: bool = False,
 ) -> BugLocation | None:
-    """Best-effort match from event payload to a changed file."""
+    """Best-effort match from event payload to a changed file.
+
+    When ``route_scoped`` is True, ``file_changes`` has already been
+    filtered to files belonging to the bug's route. In that mode we
+    suppress the global symbol-change fallback — guessing a file from
+    another route is *anti-helpful* (the user is being told to look at
+    code that doesn't even run on the failing route). Better to return
+    None and let the report say "no suspected location" than to point
+    at the wrong file with high apparent confidence.
+    """
     blob = _stringify_payload(payload)
 
     # First pass: extract explicit ``path:line`` and check against the diff.
@@ -294,12 +449,26 @@ def _suspected_location(
             line = fc.hunks[0].new_start if fc.hunks else 1
             return BugLocation(file=fc.path, line=max(line, 1))
 
-    # Third pass: fall back to the first symbol change, if any.
-    if symbol_changes:
+    # Third pass: only when we have NO route scoping signal at all.
+    # If the caller supplied route_files but this route's changed-file
+    # set is empty or didn't match, we'd rather emit None than point
+    # the user at unrelated code.
+    if symbol_changes and not route_scoped:
         first = symbol_changes[0]
         return BugLocation(
             file=first.file, line=max(first.symbol.start_line, 1)
         )
+
+    # Fourth pass (route-scoped): if there ARE route-scoped changed
+    # files but nothing in the payload referenced any of them, point
+    # at the first one's first hunk. This is still a guess, but it's
+    # at minimum guaranteed to be a file the user changed and that
+    # runs on the failing route — both necessary conditions to be a
+    # plausible cause.
+    if route_scoped and file_changes:
+        fc = file_changes[0]
+        line = fc.hunks[0].new_start if fc.hunks else 1
+        return BugLocation(file=fc.path, line=max(line, 1))
     return None
 
 

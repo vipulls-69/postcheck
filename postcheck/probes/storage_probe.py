@@ -154,31 +154,137 @@ _INIT_SCRIPT = r"""
     };
   }
 
-  // IndexedDB.open wrapper.
+  // IndexedDB wrapper. The IDB API is event-based, not promise-based, so
+  // we intercept the request prototype's open(), then — once a DB is
+  // available — wrap its transaction()/objectStore()/put/add/delete chain
+  // so individual write failures (QuotaExceededError, DataCloneError)
+  // surface as their own events. Each wrapped object carries a
+  // ``__postcheck_wrapped`` marker so we never double-wrap.
+  const wrapStoreMethod = (store, methodName, dbName, storeName) => {
+    let orig;
+    try { orig = store[methodName].bind(store); } catch (_) { return; }
+    store[methodName] = function (...args) {
+      // Best-effort key extraction: put/add take (value, key?), delete/get
+      // take (key). The cursor over args picks the one that's likely the
+      // key string; falls back to '<key>' if nothing scalar is present.
+      let keyHint = null;
+      try {
+        if (methodName === 'delete' || methodName === 'get') {
+          keyHint = args[0];
+        } else if (args.length >= 2) {
+          keyHint = args[1];
+        } else if (args[0] && typeof args[0] === 'object' && 'id' in args[0]) {
+          keyHint = args[0].id;
+        }
+      } catch (_) {}
+      let req;
+      try {
+        req = orig(...args);
+      } catch (err) {
+        push({
+          kind: 'idb_write',
+          database: dbName,
+          store: storeName,
+          operation: methodName,
+          key: safeStr(keyHint),
+          success: false,
+          error: safeStr(err),
+          errorName: err && err.name,
+        });
+        throw err;
+      }
+      try {
+        req.addEventListener('success', () => {
+          push({
+            kind: 'idb_write',
+            database: dbName,
+            store: storeName,
+            operation: methodName,
+            key: safeStr(keyHint != null ? keyHint : (req.result && req.result.toString())),
+            success: true,
+          });
+        });
+        req.addEventListener('error', (ev) => {
+          const err = req.error;
+          push({
+            kind: 'idb_write',
+            database: dbName,
+            store: storeName,
+            operation: methodName,
+            key: safeStr(keyHint),
+            success: false,
+            error: safeStr(err),
+            errorName: err && err.name,
+          });
+          // Don't preventDefault — leave the app's own onerror semantics alone.
+        });
+      } catch (_) {}
+      return req;
+    };
+  };
+
+  const wrapDb = (db, dbName) => {
+    if (!db || db.__postcheck_wrapped) return;
+    try { db.__postcheck_wrapped = true; } catch (_) { return; }
+    let origTxn;
+    try { origTxn = db.transaction.bind(db); } catch (_) { return; }
+    db.transaction = function (...txnArgs) {
+      const txn = origTxn(...txnArgs);
+      try {
+        const origObjectStore = txn.objectStore.bind(txn);
+        txn.objectStore = function (storeName) {
+          const store = origObjectStore(storeName);
+          if (!store.__postcheck_wrapped) {
+            try { store.__postcheck_wrapped = true; } catch (_) {}
+            wrapStoreMethod(store, 'put', dbName, storeName);
+            wrapStoreMethod(store, 'add', dbName, storeName);
+            wrapStoreMethod(store, 'delete', dbName, storeName);
+          }
+          return store;
+        };
+      } catch (_) {}
+      return txn;
+    };
+  };
+
   if (window.indexedDB && typeof window.indexedDB.open === 'function') {
     const origOpen = window.indexedDB.open.bind(window.indexedDB);
     window.indexedDB.open = function (name, version) {
       const req = origOpen(name, version);
+      let upgradeAttempted = false;
       try {
-        req.addEventListener('error', () => {
-          const err = req.error ? safeStr(req.error) : 'open error';
+        req.addEventListener('upgradeneeded', () => {
+          upgradeAttempted = true;
+          // Wrap the DB before the app's own upgrade handler runs, so any
+          // store mutations during upgrade are also instrumented.
+          try { wrapDb(req.result, safeStr(name)); } catch (_) {}
+        });
+        req.addEventListener('blocked', () => {
           push({
-            kind: 'storage_write',
-            storage: 'indexedDB',
-            operation: 'open',
-            key: safeStr(name),
-            success: false,
-            error: err,
+            kind: 'idb_blocked',
+            database: safeStr(name),
+            version: version != null ? version : null,
+          });
+        });
+        req.addEventListener('error', () => {
+          const err = req.error;
+          push({
+            kind: 'idb_error',
+            database: safeStr(name),
+            source: 'open',
+            phase: upgradeAttempted ? 'upgradeneeded' : 'open',
+            error: err ? safeStr(err) : 'open error',
+            errorName: err && err.name,
           });
         });
         req.addEventListener('success', () => {
           push({
-            kind: 'storage_write',
-            storage: 'indexedDB',
+            kind: 'idb_open',
+            database: safeStr(name),
             operation: 'open',
-            key: safeStr(name),
             success: true,
           });
+          try { wrapDb(req.result, safeStr(name)); } catch (_) {}
         });
       } catch (_) {}
       return req;
@@ -206,8 +312,16 @@ _VALID_KINDS = frozenset(
         "storage_write",
         "storage_quota_error",
         "storage_serialization_error",
+        "storage_idb_version_error",
+        "storage_idb_quota_error",
+        "storage_idb_blocked",
+        "storage_idb_serialization_error",
     }
 )
+
+# In-page records use one of these ``kind`` strings; the builder below
+# maps them onto the canonical ``ProbeEvent`` kinds above.
+_IDB_RAW_KINDS = frozenset({"idb_open", "idb_write", "idb_error", "idb_blocked"})
 
 
 class StorageProbe:
@@ -274,6 +388,8 @@ class StorageProbe:
 
     def _build_event(self, record: dict[str, Any]) -> ProbeEvent | None:
         kind = record.get("kind")
+        if kind in _IDB_RAW_KINDS:
+            return self._build_idb_event(record)
         if kind not in _VALID_KINDS:
             return None
         payload = {
@@ -289,6 +405,75 @@ class StorageProbe:
             "captured_at": _utcnow_iso(),
         }
         # Strip Nones to keep payloads tidy and JSON-serialisable in DB.
+        payload = {k: v for k, v in payload.items() if v is not None}
+        return ProbeEvent(
+            probe="storage",
+            route=self._route_provider() or "",
+            interaction_index=self._interaction_provider(),
+            payload=payload,
+        )
+
+    # ------------------------------------------------------------------
+    # IndexedDB categorisation
+    # ------------------------------------------------------------------
+
+    def _build_idb_event(self, record: dict[str, Any]) -> ProbeEvent | None:
+        """Map an in-page IDB record onto a canonical storage kind.
+
+        Successful ``idb_open`` / ``idb_write`` become ``storage_write``
+        (the informational kind the bug aggregator drops). Failures fan
+        out by ``errorName`` and ``phase``:
+
+        * upgrade-context error or ``VersionError`` / ``AbortError`` →
+          ``storage_idb_version_error``
+        * ``QuotaExceededError`` → ``storage_idb_quota_error``
+        * ``DataCloneError`` → ``storage_idb_serialization_error``
+        * blocked event → ``storage_idb_blocked``
+        * anything else → ``storage_idb_version_error`` as a catch-all so
+          we don't silently drop a real IDB failure (fail open).
+        """
+        raw = record.get("kind")
+        success = bool(record.get("success"))
+        error_name = record.get("errorName")
+        phase = record.get("phase")
+
+        if raw == "idb_blocked":
+            canonical = "storage_idb_blocked"
+        elif raw in ("idb_open", "idb_write") and success:
+            canonical = "storage_write"
+        elif raw == "idb_error" or (
+            raw in ("idb_open", "idb_write") and not success
+        ):
+            if error_name == "QuotaExceededError":
+                canonical = "storage_idb_quota_error"
+            elif error_name == "DataCloneError":
+                canonical = "storage_idb_serialization_error"
+            elif error_name in ("VersionError", "AbortError") or phase == (
+                "upgradeneeded"
+            ):
+                canonical = "storage_idb_version_error"
+            else:
+                # Unknown IDB failure — surface it under version_error
+                # rather than dropping. The error string carries the
+                # detail; aggregator renders ``errorName`` in the title.
+                canonical = "storage_idb_version_error"
+        else:
+            return None
+
+        payload = {
+            "kind": canonical,
+            "storage": "indexedDB",
+            "operation": record.get("operation") or raw.removeprefix("idb_"),
+            "database": record.get("database"),
+            "store": record.get("store"),
+            "key": record.get("key"),
+            "success": success,
+            "error": record.get("error"),
+            "error_name": error_name,
+            "phase": phase,
+            "in_page_timestamp_ms": record.get("timestamp"),
+            "captured_at": _utcnow_iso(),
+        }
         payload = {k: v for k, v in payload.items() if v is not None}
         return ProbeEvent(
             probe="storage",

@@ -30,6 +30,7 @@ import typer
 from .. import __version__ as _pkg_version
 from ..core.errors import PostcheckError
 from ..core.logging import configure_logging
+from .commands import config as config_cmd
 from .commands import doctor as doctor_cmd
 from .commands import init as init_cmd
 from .commands import projects as projects_cmd
@@ -42,8 +43,10 @@ app = typer.Typer(
     help=(
         "Postcheck — post-completion verification CLI.\n\n"
         "Exit codes: 0=clean, 1=bugs found, 2=verifier failed, 3=usage/config error.\n"
-        "Config precedence: flags > env (POSTCHECK_*) > .postcheck/config.json > defaults.\n"
-        "Logs: .postcheck/postcheck.log (JSON, secrets redacted). Pass --verbose for stderr logs."
+        "Config layers (lowest → highest precedence): defaults < global < project < env < flag.\n"
+        "  global file:  ~/.config/postcheck/config.json  (XDG_CONFIG_HOME aware)\n"
+        "  project file: .postcheck/config.json\n"
+        "Use `postcheck config --help` to inspect or change config; `--verbose` for stderr logs."
     ),
     no_args_is_help=True,
     add_completion=False,
@@ -120,6 +123,13 @@ projects_app.command("add", help="Register a project record.")(projects_cmd.add_
 projects_app.command(
     "remove", help="Remove a project record (cascades runs + bugs)."
 )(projects_cmd.remove_cmd)
+
+
+app.add_typer(
+    config_cmd.build_app(),
+    name="config",
+    help="Inspect or modify layered configuration (global + project).",
+)
 
 
 # ---------------------------------------------------------------------------

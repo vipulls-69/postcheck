@@ -152,7 +152,9 @@ The single most important section of this file. **Do not implement post-v0 or v1
 *Operational:*
 - Structured logging via `structlog` (JSON to `.postcheck/postcheck.log`, pretty to stderr when verbose, silent by default)
 - Secret redaction on all log paths (REDACTION_PATTERNS for Bearer tokens, JWTs, API keys)
-- Config layering: defaults → `.postcheck/config.json` → env vars (`POSTCHECK_*`) → CLI flags
+- Config layering (lowest → highest precedence): built-in defaults → global config file → project config file → `POSTCHECK_*` env vars → CLI flags
+- Global config lives at `~/.config/postcheck/config.json` (XDG_CONFIG_HOME aware) or `%APPDATA%\postcheck\config.json` on Windows; project config at `.postcheck/config.json`
+- `postcheck config {get,set,unset,edit}` for inspecting and modifying configuration; each field declares which layers it accepts (global-only, project-only, either) and the loader warns + skips fields persisted at the wrong layer (forward compatibility, never crash)
 - Works on macOS, Linux (including Codespaces), and Windows
 
 **v0 IS NOT:**
@@ -176,6 +178,8 @@ The single most important section of this file. **Do not implement post-v0 or v1
 - Screenshot PII redaction (because no screenshots ship to LLMs in v0)
 - Confidence-based suppression / `.postcheckignore`
 - Any framework adapter beyond plain HTML and React/Vite
+
+v0 scenario runner triggers only click-style interactions automatically (clicks on buttons, links, and elements with click handlers). Form submission via "fill required inputs and submit" may be added before v0 ships if dogfooding reveals it's needed. Hover, drag-and-drop, keyboard navigation, complex input typing patterns, and touch/pointer gestures are explicitly deferred to v1, where they're paired with the supporting analysis (vision-judge for hover, cross-route impact for drag targets, a11y probe for keyboard, adversarial test generation for input fuzzing).
 
 **v0 "done" criteria:**
 
@@ -231,6 +235,7 @@ The verification engine itself does not change in post-v0. The orchestrator, ana
 - Bug deduplication via causal grouping
 - Adapter contract stabilization — formally locked in v1, both v0 adapters refactored if needed
 - Third adapter: one of Next.js full, Vue, Svelte, or Angular, chosen by user demand
+- Several v1 features unlock new interaction modes for the scenario runner: vision-judge enables reliable hover testing (tooltip visibility judged visually); cross-route impact analysis lets drag-and-drop scenarios know valid source/target pairs; the a11y probe brings keyboard navigation under axe-core; adversarial scenario generation handles controlled-input fuzzing with multiple value patterns. These features should ship together as the "expanded interaction model" v1 milestone, not piecemeal.
 
 **v1 product surface adds:**
 
@@ -528,7 +533,8 @@ SQLModel tables, all with `id` UUID, `created_at`, `updated_at` UTC. Domain tabl
 - `Organization` — id, name, slug, created_at, updated_at
 - `Project` — id, org_id, name, local_path, default_adapter (nullable), config_overrides (JSON), created_at, updated_at
 - `Run` — id, org_id, project_id, status (Literal: running, succeeded, failed, errored), since_ref, started_at, finished_at, total_bugs, report_json (JSON: full VerifyResult)
-- `Bug` — id, org_id, run_id, probe, route, interaction_summary, error_message, suspected_file (nullable), suspected_line (nullable int), confidence (Literal: deterministic, heuristic, llm_judged), raw_event (JSON)
+- `Bug` — id, org_id, run_id, probe, route, interaction_summary, title, detail, suspected_file (nullable), suspected_line (nullable int), confidence (Literal: deterministic, heuristic, llm_judged), raw_event (JSON)
+  - The earlier single `error_message` column was retired in favour of the `title` (one-line headline) + `detail` (multi-line body) split. The single-field shape conflated headline and body, producing unreadable rows in both CLI table output and the persisted JSON. The new split matches standard error-reporting patterns and what the core `Bug` model has always exposed. Migration `0002_bug_split_message` performs the rename and backfills `title` from any pre-existing `error_message` values.
 
 Indexes: Run on `(project_id, started_at DESC)`, Bug on `run_id`. Foreign keys enforced via SQLite PRAGMA.
 
@@ -570,6 +576,10 @@ typer app. Global options: `--config`, `--verbose`, `--version`. Top-level excep
 
 Sanity checks: Python version, Playwright browsers installed, git available, cwd has `.postcheck/`, DB readable, dev server reachable at `config.baseUrl`. Prints checklist with ✓/✗. Exit 0 if all pass, 1 if any fail.
 
+### `cli/commands/config.py` (v0)
+
+Layered-config management. Subcommands: `get [key] [--show] [--global] [--project]`, `set <key> <value> [--global]`, `unset <key> [--global]`, `edit [--global]`. Defaults to writing the project config; `--global` targets the user-global file. Validates that the target layer accepts the field (e.g. `set launch_mode --global` is allowed; `set launch_mode` at project layer is rejected with a hint). Accepts dotted keys for nested fields (`network.treat_cross_origin_as`); list/dict values must be JSON-encoded. Re-validates the full merged config before persisting; never writes if the result would be invalid. Unknown keys get close-match suggestions via `difflib.get_close_matches`.
+
 ### `cli/utils.py` (v0)
 
 Shared CLI helpers: project root discovery (walk up from cwd looking for `.postcheck/`), run ID prefix resolution, table rendering, color-respecting print.
@@ -604,6 +614,32 @@ Shared CLI helpers: project root discovery (walk up from cwd looking for `.postc
 - Migrations are append-only — never edit a shipped migration
 - All queries scoped by `org_id` at the repository layer; never write a query that bypasses tenancy
 - SQLite-specific: `PRAGMA foreign_keys=ON` set on every connection via SQLAlchemy event listener
+
+### Configuration model
+
+Configuration is loaded by `postcheck.core.config.load_config()` from five layers, lowest → highest precedence:
+
+```
+DEFAULT  →  GLOBAL  →  PROJECT  →  ENV (POSTCHECK_*)  →  FLAG (CLI)
+```
+
+- **DEFAULT** — hard-coded in `Settings` field defaults.
+- **GLOBAL** — `~/.config/postcheck/config.json` (XDG_CONFIG_HOME aware) or `%APPDATA%\postcheck\config.json` on Windows. Resolved via `get_global_config_path()`.
+- **PROJECT** — `<project_root>/.postcheck/config.json`.
+- **ENV** — `POSTCHECK_*` environment variables; nested via `__` (e.g. `POSTCHECK_NETWORK__TREAT_CROSS_ORIGIN_AS`). Secrets (`DATABASE_URL`, `REDIS_URL`, `ANTHROPIC_API_KEY`) are env-only.
+- **FLAG** — `cli_overrides` dict supplied by the CLI at runtime; never persisted.
+
+Every `Settings` field declares its allowed layers via `Field(json_schema_extra={"layers": [...]})`. If a config file persists a value for a layer it isn't allowed at (e.g. `base_url` in global, `launch_mode` in project), the loader emits a `structlog` warning and skips the field. Files persist across versions — never crash on unknown or layer-misplaced keys.
+
+Field policy (v0):
+
+- **Global-only**: `launch_mode`, `chrome_debug_port`, `chrome_profile_dir`, `default_adapter_override`, `color_mode`, `verbose_default`.
+- **Project-only**: `base_url`, `adapter`, `exclude_globs`.
+- **Either** (project overrides global): `launch_headless`, `launch_args`, `timeout_ms`, `network.*`.
+- **Env-only** (secrets): `database_url`, `redis_url`, `anthropic_api_key`.
+- **Flag-only** (never persisted): `--since`, `--output`, `--json`, `--project`, `--verbose`.
+
+`load_config_with_provenance()` additionally returns a `{field_path: ConfigLayer}` map for `postcheck config get --show`. When extending the schema, add `json_schema_extra={"layers": [...]}` to every new `Field`.
 
 ### CLI conventions
 

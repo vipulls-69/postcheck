@@ -6,9 +6,12 @@ Subscribes to three Playwright page events:
   Emits :class:`ProbeEvent` ``payload.kind = "runtime_error"`` with the
   message and (when present) the JS stack trace.
 * ``console`` — JS console output, filtered to ``error`` and ``warning``
-  levels only. Emits ``"runtime_error"`` for console errors and
-  ``"runtime_warning"`` for warnings; carries the source location reported
-  by the renderer.
+  levels only. Emits ``"runtime_console_error"`` for ``console.error``
+  (and failing ``console.assert``) and ``"runtime_console_warning"`` for
+  ``console.warn``; carries the source location reported by the renderer.
+  These are *intentionally* distinct from ``runtime_error`` — a logged
+  console.error is not the same defect as an uncaught throw, and the
+  bug aggregator ranks them separately.
 * ``crash`` — the renderer process died. Emits ``"page_crash"``. Treated as
   a single, terminal event.
 
@@ -34,12 +37,15 @@ if TYPE_CHECKING:
 # ``log | debug | info | error | warning | dir | dirxml | table | trace |
 # clear | startGroup | startGroupCollapsed | endGroup | assert | profile |
 # profileEnd | count | timeEnd``. Only ``error`` and ``warning`` are
-# actionable for v0; ``assert`` is treated as an error too because that's
-# what a failing ``console.assert`` actually is.
+# actionable for v0; ``assert`` is treated as a console error too because
+# that's what a failing ``console.assert`` actually is. These kinds are
+# deliberately distinct from ``runtime_error`` (uncaught throw, via
+# ``pageerror``) so the aggregator can rank a logged-and-handled error
+# below an actual uncaught exception.
 _CONSOLE_KINDS: dict[str, str] = {
-    "error": "runtime_error",
-    "warning": "runtime_warning",
-    "assert": "runtime_error",
+    "error": "runtime_console_error",
+    "warning": "runtime_console_warning",
+    "assert": "runtime_console_error",
 }
 
 

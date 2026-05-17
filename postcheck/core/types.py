@@ -58,6 +58,77 @@ LocationFailureReason = Literal[
 ]
 RunStatus = Literal["pending", "running", "completed", "failed", "cancelled"]
 
+# Probe event ``payload['kind']`` values currently produced by core. The
+# ``payload`` dict itself is intentionally free-form (see ``ProbeEvent``),
+# but this alias documents the strings the bug aggregator and UI probe
+# agree on so adding new kinds is a deliberate, reviewable change.
+UiEventKind = Literal[
+    "ui_no_change",
+    "ui_overlay_blocks",
+    "ui_locator_timeout",
+    "ui_element_hidden",
+    "ui_element_detached",
+]
+
+# Kinds emitted by :class:`postcheck.probes.network_probe.NetworkProbe`.
+# ``network_error`` and ``navigation_failure`` remain the catch-all for
+# 4xx / 5xx and generic ``requestfailed``; the ``network_*`` variants
+# below split out the failure modes Playwright reports via
+# ``request.failure`` so the bug aggregator can render them distinctly.
+NetworkEventKind = Literal[
+    "network_error",
+    "navigation_failure",
+    "network_aborted",
+    "network_timeout",
+    "network_dns_error",
+    "network_connection_error",
+    # Synthesised by ``NetworkProbe.detach()`` when a request started but
+    # never produced a ``response`` or ``requestfailed`` within the
+    # scenario's ``detach_grace_ms`` window. Heuristic, not an abort —
+    # most often a slow server. Ranked lower than ``network_aborted``,
+    # which comes from a real Chromium ``ERR_ABORTED`` classification.
+    "network_unresolved_at_detach",
+]
+
+# Kinds emitted by :class:`postcheck.probes.storage_probe.StorageProbe`.
+# ``storage_write`` is the informational successful-mutation event the
+# bug aggregator drops on the floor (covers both Web Storage and IDB
+# successes); the rest are failure categories.
+StorageEventKind = Literal[
+    "storage_write",
+    "storage_quota_error",
+    "storage_serialization_error",
+    "storage_idb_version_error",
+    "storage_idb_quota_error",
+    "storage_idb_blocked",
+    "storage_idb_serialization_error",
+]
+
+# Kinds emitted by :class:`postcheck.probes.runtime_probe.RuntimeProbe`.
+# ``runtime_error`` is reserved for **uncaught** JS exceptions reported
+# via the Playwright ``pageerror`` event — the high-severity bucket.
+# Direct ``console.error`` / ``console.warn`` calls become
+# ``runtime_console_error`` / ``runtime_console_warning`` so the bug
+# aggregator can rank them lower (a logged-and-handled error is not the
+# same defect as an uncaught throw).
+RuntimeEventKind = Literal[
+    "runtime_error",
+    "runtime_console_error",
+    "runtime_console_warning",
+    "page_crash",
+]
+
+# Values for ``probe="scenario"`` event ``payload['type']``. ``scenario_
+# failure`` is the harness-error path consumed by the bug aggregator;
+# ``scenario_recovery`` is informational (a between-interaction reload)
+# and is intentionally *not* a bug.
+ScenarioEventType = Literal["scenario_failure", "scenario_recovery"]
+
+# How aggressively the scenario runner resets page state between
+# interactions on the same route. ``on_failure`` is the v0 default; see
+# ``ScenarioSettings.recovery_mode`` in :mod:`postcheck.core.config`.
+RecoveryMode = Literal["always", "on_failure", "never"]
+
 
 # ---------------------------------------------------------------------------
 # Base
@@ -144,11 +215,30 @@ class Route(_Model):
 
 
 class Selector(_Model):
-    """A target-element selector with a strategy hint."""
+    """A target-element selector with a strategy hint.
+
+    ``symbol_name`` is an *optional* back-pointer to the changed symbol the
+    adapter believes this selector binds to. When the adapter sets it,
+    multiple selectors sharing the same name are treated as **fallbacks for
+    one target** by ``browser.target_locator.locate`` (the higher-priority
+    strategy wins). When unset (v0 adapters), the locator falls back to
+    fingerprint-based deduplication.
+
+    ``expected_visible_effect`` is the adapter's *best-effort* prediction
+    of whether the bound handler mutates user-visible state (calls
+    ``setState`` / ``setX`` / ``useReducer.dispatch`` etc.). The UI probe
+    uses it to grade ``ui_no_change`` findings: ``True`` -> deterministic
+    bug if the route window didn't change; ``False`` -> suppress the
+    finding (the handler is intentionally side-effect-only, e.g. a pure
+    analytics call); ``None`` -> the adapter could not tell, so any
+    ``ui_no_change`` emitted ships at ``confidence='heuristic'``.
+    """
 
     strategy: SelectorStrategy
     value: str
     confidence: ImpactConfidence = "high"
+    symbol_name: str | None = None
+    expected_visible_effect: bool | None = None
 
 
 class AffectedRoute(_Model):
@@ -307,17 +397,23 @@ __all__ = [
     "InteractionKind",
     "LocationFailure",
     "LocationFailureReason",
+    "NetworkEventKind",
     "ProbeEvent",
     "ProbeName",
+    "RecoveryMode",
     "Route",
     "RunStatus",
+    "RuntimeEventKind",
+    "ScenarioEventType",
     "Selector",
     "SelectorStrategy",
     "StateGraph",
+    "StorageEventKind",
     "Symbol",
     "SymbolChange",
     "SymbolGraph",
     "SymbolKind",
+    "UiEventKind",
     "VerifyOptions",
     "VerifyResult",
 ]

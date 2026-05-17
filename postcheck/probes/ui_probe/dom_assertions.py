@@ -34,7 +34,11 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
 from ...core.types import ProbeEvent
-from ..shared import get_current_route, get_interaction_index
+from ..shared import (
+    drain_ui_interaction_failures,
+    get_current_route,
+    get_interaction_index,
+)
 
 if TYPE_CHECKING:
     from playwright.async_api import Page
@@ -43,10 +47,24 @@ if TYPE_CHECKING:
 
 
 # JS evaluated against the target element. Returns ``null`` if the element
-# vanished between locator resolution and snapshot time. Truncates body text
-# to 4 KB so the comparison stays cheap on large pages — collisions inside
-# 4 KB *and* identical body HTML length *and* identical target outerHTML are
-# vanishingly unlikely to be a real change we care about.
+# vanished between locator resolution and snapshot time.
+#
+# The snapshot has two layers:
+#
+# * **Target layer** (``outerHTML`` / ``visible`` / ``covered`` /
+#   ``cover_descriptor``) — used only for ``ui_overlay_blocks`` detection.
+#   We intentionally do *not* feed target ``outerHTML`` into the
+#   "did anything change?" decision: many real handlers update a sibling
+#   element (``setMsg(...)`` writing to a ``<p data-testid="*-msg">``),
+#   which would leave the clicked button's HTML identical and produce a
+#   false "no visible effect" bug.
+# * **Route-window layer** (``text_length`` / ``child_count`` /
+#   ``text_hash``) — three cheap signals on ``document.body``. If *any*
+#   one differs between before/after, the interaction had a visible
+#   effect and we emit nothing. ``text_hash`` is a 32-bit FNV-1a of the
+#   first 16 KB of ``innerText``; combined with the integer length and
+#   child count, the collision probability for a real mutation that
+#   leaves all three identical is negligible.
 _SNAPSHOT_JS = r"""
 (el) => {
   if (!el) return null;
@@ -74,15 +92,27 @@ _SNAPSHOT_JS = r"""
     }
   }
   const body = document.body;
-  const bodyText = body ? (body.innerText || '').slice(0, 4096) : '';
-  const bodyHtmlLen = body ? body.innerHTML.length : 0;
+  const text = body ? (body.innerText || '') : '';
+  // FNV-1a 32-bit over the first 16 KB of visible text.
+  const sample = text.slice(0, 16384);
+  let h = 0x811c9dc5 >>> 0;
+  for (let i = 0; i < sample.length; i++) {
+    h ^= sample.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  const childCount = body ? body.getElementsByTagName('*').length : 0;
   return {
     outerHTML: el.outerHTML,
     visible: visible,
     covered: covered,
     cover_descriptor: coverDescriptor,
-    body_text: bodyText,
-    body_html_length: bodyHtmlLen,
+    text_length: text.length,
+    child_count: childCount,
+    text_hash: h,
+    // Legacy fields retained for backwards compatibility with stub-based
+    // unit tests that pre-date the route-window snapshot redesign.
+    body_text: text.slice(0, 4096),
+    body_html_length: body ? body.innerHTML.length : 0,
   };
 }
 """
@@ -90,6 +120,20 @@ _SNAPSHOT_JS = r"""
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# Route-window diff. Uses the three new metrics when present (real
+# browser path); falls back to the legacy ``body_text`` /
+# ``body_html_length`` pair so unit-test stubs that pre-date the
+# redesign keep working without modification.
+_NEW_METRICS = ("text_length", "child_count", "text_hash")
+_LEGACY_METRICS = ("body_text", "body_html_length")
+
+
+def _window_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    if any(k in after and k in before for k in _NEW_METRICS):
+        return any(before.get(k) != after.get(k) for k in _NEW_METRICS)
+    return any(before.get(k) != after.get(k) for k in _LEGACY_METRICS)
 
 
 class DomAssertionsProbe:
@@ -111,6 +155,10 @@ class DomAssertionsProbe:
         self._buffer: list[ProbeEvent] = []
         # interaction_index -> snapshot dict
         self._snapshots: dict[int, dict[str, Any]] = {}
+        # (interaction_index, kind) pairs already emitted — used to
+        # dedupe between ``before_interaction`` overlay detection and a
+        # follow-up ``ui_overlay_blocks`` queued by the scenario runner.
+        self._emitted: set[tuple[int | None, str]] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -120,12 +168,36 @@ class DomAssertionsProbe:
         self._page = page
 
     def collect_events(self) -> list[ProbeEvent]:
+        # Drain any per-interaction failures the scenario runner queued
+        # since the last call (locator timeouts, hidden / detached
+        # elements, overlay-blocked clicks) and emit them as ``probe=ui``
+        # events with the precise kind. Overlay collisions with our own
+        # ``before_interaction`` snapshot are deduped via ``_emitted``.
+        for fail in drain_ui_interaction_failures():
+            key = (fail.index, fail.kind)
+            if key in self._emitted:
+                continue
+            self._buffer.append(
+                ProbeEvent(
+                    probe="ui",
+                    route=fail.route or self._route_provider() or "",
+                    interaction_index=fail.index,
+                    payload={
+                        "kind": fail.kind,
+                        "selector": fail.selector,
+                        "error": fail.error,
+                        "captured_at": _utcnow_iso(),
+                    },
+                )
+            )
+            self._emitted.add(key)
         out, self._buffer = self._buffer, []
         return out
 
     async def detach(self) -> None:
         self._page = None
         self._snapshots.clear()
+        self._emitted.clear()
 
     # ------------------------------------------------------------------
     # Interaction hooks (called by scenario_runner)
@@ -158,18 +230,31 @@ class DomAssertionsProbe:
             # change, so explicitly do not emit ui_no_change.
             return
 
-        if (
-            before.get("outerHTML") == after.get("outerHTML")
-            and before.get("body_text") == after.get("body_text")
-            and before.get("body_html_length") == after.get("body_html_length")
-        ):
-            self._emit(
-                kind="ui_no_change",
-                target=target,
-                target_outer_html_unchanged=True,
-                body_text_length=len(after.get("body_text") or ""),
-                body_html_length=after.get("body_html_length"),
-            )
+        # Route-window diff — see ``_SNAPSHOT_JS`` docstring for why these
+        # three signals (and *not* target outerHTML) drive the decision.
+        # Falls back to the legacy ``body_text`` / ``body_html_length``
+        # pair when the new fields are absent (unit-test stubs).
+        window_changed = _window_changed(before, after)
+
+        if not window_changed:
+            expected = target.selector.expected_visible_effect
+            # ``False`` => adapter is confident the handler has no
+            # user-visible effect (analytics, fire-and-forget fetch,
+            # etc.). Suppress the finding entirely; surfacing it would
+            # be pure noise.
+            if expected is not False:
+                confidence = "deterministic" if expected is True else "heuristic"
+                self._emit(
+                    kind="ui_no_change",
+                    target=target,
+                    target_outer_html_unchanged=(
+                        before.get("outerHTML") == after.get("outerHTML")
+                    ),
+                    text_length=after.get("text_length", after.get("body_html_length")),
+                    child_count=after.get("child_count"),
+                    confidence=confidence,
+                    expected_visible_effect=expected,
+                )
 
         if after.get("covered") and not before.get("covered"):
             self._emit(
@@ -223,6 +308,7 @@ class DomAssertionsProbe:
                 payload=payload,
             )
         )
+        self._emitted.add((self._interaction_provider(), kind))
 
 
 __all__ = ["DomAssertionsProbe"]

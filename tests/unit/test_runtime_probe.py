@@ -147,7 +147,7 @@ async def test_pageerror_with_no_stack_still_captured():
 # ---------------------------------------------------------------------------
 
 
-async def test_console_error_emits_runtime_error_with_location():
+async def test_console_error_emits_runtime_console_error_with_location():
     probe = RuntimeProbe()
     page = StubPage()
     await probe.attach(page)
@@ -161,7 +161,10 @@ async def test_console_error_emits_runtime_error_with_location():
         ),
     )
     [event] = probe.collect_events()
-    assert event.payload["kind"] == "runtime_error"
+    # Console errors are deliberately distinct from pageerror's
+    # ``runtime_error`` — a logged-and-handled error is meaningfully
+    # less severe than an uncaught throw.
+    assert event.payload["kind"] == "runtime_console_error"
     assert event.payload["console_type"] == "error"
     assert event.payload["message"] == "bad thing"
     assert event.payload["location"] == {
@@ -171,22 +174,22 @@ async def test_console_error_emits_runtime_error_with_location():
     }
 
 
-async def test_console_warning_emits_runtime_warning():
+async def test_console_warning_emits_runtime_console_warning():
     probe = RuntimeProbe()
     page = StubPage()
     await probe.attach(page)
     page.fire("console", StubConsole(type="warning", text="hmm"))
     [event] = probe.collect_events()
-    assert event.payload["kind"] == "runtime_warning"
+    assert event.payload["kind"] == "runtime_console_warning"
 
 
-async def test_console_assert_classified_as_runtime_error():
+async def test_console_assert_classified_as_runtime_console_error():
     probe = RuntimeProbe()
     page = StubPage()
     await probe.attach(page)
     page.fire("console", StubConsole(type="assert", text="assertion failed"))
     [event] = probe.collect_events()
-    assert event.payload["kind"] == "runtime_error"
+    assert event.payload["kind"] == "runtime_console_error"
 
 
 @pytest.mark.parametrize("ctype", ["log", "info", "debug", "trace"])

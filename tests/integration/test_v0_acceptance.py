@@ -403,6 +403,18 @@ def test_verify_catches_runtime_bug(
     bugs = payload.get("bugs", [])
     assert bugs, f"expected bugs in buggy run, got none\n{combined}"
 
+    # Every bug must carry a non-empty headline. The pre-Phase-F
+    # ``error_message`` field has been retired in favour of
+    # ``title`` (headline) + ``detail`` (body); bug_aggregator's
+    # recipe table guarantees a title for every emitted kind. An empty
+    # title in the report would mean either a probe emitted a kind the
+    # aggregator doesn't know about, or the formatter regressed to its
+    # ``"<kind> fired"`` fallback.
+    titleless = [b for b in bugs if not (b.get("title") or "").strip()]
+    assert not titleless, (
+        f"bugs with empty title: {json.dumps(titleless, indent=2)}"
+    )
+
     runtime = [b for b in bugs if b.get("probe") == "runtime"]
     assert runtime, (
         f"no runtime probe bugs in buggy run; probes: "

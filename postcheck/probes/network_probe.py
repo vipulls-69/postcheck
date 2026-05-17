@@ -55,6 +55,63 @@ def _origin(url: str) -> str:
     return f"{p.scheme}://{p.netloc}"
 
 
+# Chromium's ``net::ERR_*`` strings come through Playwright's
+# ``request.failure`` verbatim. Map the families we care about onto
+# distinct ``payload.kind`` values so the bug aggregator can rank them
+# (a user-initiated abort is not the same defect as a DNS failure).
+# Anything not matched here falls back to the generic ``network_error``
+# (or ``navigation_failure`` for ``document`` resources) so we never
+# silently drop a failure — fail open, never silently narrow.
+_NET_ABORT_TOKENS = ("ERR_ABORTED",)
+_NET_TIMEOUT_TOKENS = (
+    "ERR_TIMED_OUT",
+    "ERR_CONNECTION_TIMED_OUT",
+    "ERR_NETWORK_IO_SUSPENDED",
+    "TimeoutError",
+)
+_NET_DNS_TOKENS = (
+    "ERR_NAME_NOT_RESOLVED",
+    "ERR_NAME_RESOLUTION_FAILED",
+    "ERR_ICANN_NAME_COLLISION",
+)
+_NET_CONNECTION_TOKENS = (
+    "ERR_CONNECTION_REFUSED",
+    "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_CLOSED",
+    "ERR_CONNECTION_FAILED",
+    "ERR_CONNECTION_ABORTED",
+    "ERR_ADDRESS_UNREACHABLE",
+    "ERR_INTERNET_DISCONNECTED",
+    "ERR_NETWORK_CHANGED",
+    "ERR_SOCKET_NOT_CONNECTED",
+    "ERR_TUNNEL_CONNECTION_FAILED",
+)
+
+
+def _classify_failure(error_text: str, *, is_navigation: bool) -> str:
+    """Map a ``request.failure`` string to a ``payload.kind``.
+
+    Navigation failures keep their ``navigation_failure`` umbrella kind
+    regardless of the underlying ``net::ERR_*`` — a document-level
+    failure is a different bug category ("page didn't load") and the
+    bug aggregator already renders it specially.
+    """
+    if is_navigation:
+        return "navigation_failure"
+    if not error_text:
+        return "network_error"
+    text = error_text
+    if any(t in text for t in _NET_ABORT_TOKENS):
+        return "network_aborted"
+    if any(t in text for t in _NET_TIMEOUT_TOKENS):
+        return "network_timeout"
+    if any(t in text for t in _NET_DNS_TOKENS):
+        return "network_dns_error"
+    if any(t in text for t in _NET_CONNECTION_TOKENS):
+        return "network_connection_error"
+    return "network_error"
+
+
 class NetworkProbe:
     """Wraps the three Playwright network events with the v0 filter chain."""
 
@@ -128,8 +185,40 @@ class NetworkProbe:
             except Exception:  # pragma: no cover
                 pass
         self._listeners = []
+        # Any request still in ``_tracked`` at detach time started during
+        # this scenario but never produced a ``response`` or
+        # ``requestfailed`` event before the scenario's
+        # ``detach_grace_ms`` window elapsed. These are *not* aborts —
+        # the user neither cancelled them nor did Chromium fail them.
+        # The most common cause is a server that takes longer than the
+        # scenario's wall budget. Emit as ``network_unresolved_at_detach``
+        # (heuristic confidence) so the aggregator can rank them lower
+        # than real, classifier-driven ``network_aborted`` events that
+        # came out of ``request.failure`` with an ``ERR_ABORTED`` token.
+        for meta in self._tracked.values():
+            self._emit(
+                "network_unresolved_at_detach",
+                meta,
+                status=None,
+                error="request did not resolve within scenario window",
+                phase="probe_detach",
+            )
         self._tracked.clear()
         self._page = None
+
+    # ------------------------------------------------------------------
+    # Idle query — consumed by the scenario runner's detach grace loop.
+    # ------------------------------------------------------------------
+
+    def pending_request_count(self) -> int:
+        """Number of tracked, in-flight requests not yet resolved/failed.
+
+        The scenario runner polls this at the end of a scenario to give
+        real Chromium ``requestfailed`` events (user-controlled aborts,
+        ``AbortSignal.timeout``, slow 5xx responses) a chance to fire
+        before the probe detaches and the events are lost.
+        """
+        return len(self._tracked)
 
     # ------------------------------------------------------------------
     # Filtering
@@ -250,7 +339,7 @@ class NetworkProbe:
                 if isinstance(failure, dict)
                 else str(failure)
             ) or "request failed"
-        kind = "navigation_failure" if meta["is_navigation"] else "network_error"
+        kind = _classify_failure(error, is_navigation=meta["is_navigation"])
         self._emit(
             kind,
             meta,

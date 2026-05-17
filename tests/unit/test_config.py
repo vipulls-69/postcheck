@@ -102,12 +102,13 @@ def _write_config(root: Path, payload: dict) -> Path:
 
 
 def test_json_file_overrides_defaults(tmp_path):
+    # chrome_debug_port is GLOBAL-only and is silently dropped from a project file
+    # (with a structlog warning). Project-level fields below still apply.
     _write_config(
         tmp_path,
         {
             "adapter": "react_vite",
             "base_url": "http://localhost:5173",
-            "chrome_debug_port": 9333,
             "timeout_ms": 12000,
             "exclude_globs": ["**/custom/**"],
             "network": {
@@ -119,7 +120,6 @@ def test_json_file_overrides_defaults(tmp_path):
     s = load_settings(tmp_path)
     assert s.adapter == "react_vite"
     assert s.base_url == "http://localhost:5173"
-    assert s.chrome_debug_port == 9333
     assert s.timeout_ms == 12000
     assert s.exclude_globs == ["**/custom/**"]
     assert s.network.ignore_patterns == ["custom-ignore"]
@@ -129,9 +129,10 @@ def test_json_file_overrides_defaults(tmp_path):
 
 
 def test_env_vars_override_json(tmp_path, monkeypatch):
+    # chrome_debug_port is global-only at the file layer but still settable via env.
     _write_config(
         tmp_path,
-        {"adapter": "react_vite", "chrome_debug_port": 9333, "timeout_ms": 12000},
+        {"adapter": "react_vite", "timeout_ms": 12000},
     )
     monkeypatch.setenv("POSTCHECK_ADAPTER", "plain_html")
     monkeypatch.setenv("POSTCHECK_CHROME_DEBUG_PORT", "9444")
@@ -166,8 +167,10 @@ def test_invalid_adapter_raises_config_error(tmp_path):
     assert "errors" in exc.value.context
 
 
-def test_invalid_port_raises_config_error(tmp_path):
-    _write_config(tmp_path, {"chrome_debug_port": 99999})
+def test_invalid_port_raises_config_error(tmp_path, monkeypatch):
+    # chrome_debug_port is global-only; project file gets dropped. Use env to
+    # exercise the validation path.
+    monkeypatch.setenv("POSTCHECK_CHROME_DEBUG_PORT", "99999")
     with pytest.raises(ConfigError) as exc:
         load_settings(tmp_path)
     msg = str(exc.value).lower()
@@ -187,10 +190,12 @@ def test_invalid_cross_origin_policy_raises_config_error(tmp_path):
     assert "treat_cross_origin_as" in str(exc.value).lower()
 
 
-def test_unknown_top_level_field_raises_config_error(tmp_path):
+def test_unknown_top_level_field_in_file_is_warned_and_skipped(tmp_path):
+    # Forward-compatibility: unknown keys in persisted config files are warned
+    # and ignored, not fatal. (See CLAUDE.md, Configuration model.)
     _write_config(tmp_path, {"mystery": 1})
-    with pytest.raises(ConfigError):
-        load_settings(tmp_path)
+    s = load_settings(tmp_path)
+    assert s.adapter == "auto"
 
 
 def test_malformed_json_raises_config_error(tmp_path):

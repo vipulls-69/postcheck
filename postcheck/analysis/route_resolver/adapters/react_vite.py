@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 
 import tree_sitter as ts
@@ -344,6 +345,12 @@ def _extract_selectors_from_file(
     tree = ts.Parser(lang).parse(source)
     candidates: list[Selector] = []
 
+    # Pre-index top-level/named function declarations + arrow assigned
+    # to identifiers, so that ``onClick={namedHandler}`` can be resolved
+    # to its body for the mutator heuristic. Best-effort; nested or
+    # imported handlers fall through to ``None``.
+    handler_bodies = _index_named_handlers(tree.root_node)
+
     for node in _walk(tree.root_node):
         if node.type not in {"jsx_element", "jsx_self_closing_element"}:
             continue
@@ -351,10 +358,16 @@ def _extract_selectors_from_file(
         has_handler = False
         attrs: dict[str, str] = {}
         testid_prefix: str | None = None
+        handler_expr_text: str | None = None
         for attr in _iter_jsx_attrs(node):
             name = _attr_name(attr)
             if name.startswith("on") and name[2:3].isupper():
                 has_handler = True
+                expr = _attr_expr_value(attr)
+                if expr is not None:
+                    handler_expr_text = _resolve_handler_body(
+                        expr, handler_bodies
+                    )
             sval = _attr_string_value(attr)
             if sval is not None:
                 attrs[name] = sval
@@ -364,29 +377,141 @@ def _extract_selectors_from_file(
                 testid_prefix = _attr_template_prefix(attr)
         if not has_handler:
             continue
+        expected = _handler_mutates_state(handler_expr_text)
+
+        def _mk(strategy: str, value: str) -> Selector:
+            # All selector candidates for one JSX element share the same
+            # ``expected_visible_effect`` prediction — they're fallbacks
+            # for one target so the UI probe's grading stays consistent.
+            return Selector(
+                strategy=strategy,  # type: ignore[arg-type]
+                value=value,
+                expected_visible_effect=expected,
+            )
+
         if "data-testid" in attrs:
-            candidates.append(Selector(strategy="test_id", value=attrs["data-testid"]))
+            candidates.append(_mk("test_id", attrs["data-testid"]))
         elif testid_prefix:
             candidates.append(
-                Selector(strategy="css", value=f'[data-testid^="{testid_prefix}"]')
+                _mk("css", f'[data-testid^="{testid_prefix}"]')
             )
         if "role" in attrs and "aria-label" in attrs:
             candidates.append(
-                Selector(strategy="role", value=f"{attrs['role']}:{attrs['aria-label']}")
+                _mk("role", f"{attrs['role']}:{attrs['aria-label']}")
             )
         elif "role" in attrs:
-            candidates.append(Selector(strategy="role", value=attrs["role"]))
+            candidates.append(_mk("role", attrs["role"]))
         if "aria-label" in attrs and "role" not in attrs:
-            candidates.append(Selector(strategy="label", value=attrs["aria-label"]))
+            candidates.append(_mk("label", attrs["aria-label"]))
         # Fallback: visible text content
         text_content = _jsx_text_content(node).strip()
         if text_content:
-            candidates.append(Selector(strategy="text", value=text_content))
+            candidates.append(_mk("text", text_content))
 
     # symbol_name may help disambiguate later; v0 returns all candidates from
     # the file as the symbol's component file is usually small.
     _ = symbol_name
     return candidates
+
+
+# ---------------------------------------------------------------------------
+# expected_visible_effect heuristic
+# ---------------------------------------------------------------------------
+
+# Matches identifiers of the shape ``setSomething(`` — React's ``useState``
+# updater convention and the dominant pattern across Zustand /
+# ``useReducer`` callsites. The conservative call-site shape (must be
+# followed by ``(``) avoids matching unrelated identifiers like ``settings``.
+_SET_CALL_RE = re.compile(r"\bset[A-Z]\w*\s*\(")
+# Additional dispatchers that mutate user-visible state.
+_DISPATCH_RE = re.compile(
+    r"\b(?:dispatch|setState|forceUpdate|mutate|refetch)\s*\("
+)
+
+
+def _handler_mutates_state(handler_body: str | None) -> bool | None:
+    """Predict whether a JSX handler mutates user-visible state.
+
+    Returns:
+        * ``True``  — body contains a ``setX(`` call, a ``dispatch(`` /
+          ``setState(`` / ``forceUpdate(`` / ``mutate(`` / ``refetch(``
+          call. The handler almost certainly drives a re-render.
+        * ``False`` — body only calls side-effect-free or fire-and-forget
+          APIs: ``console.*``, bare ``fetch(`` (no ``.then(set...)``
+          chain), ``analytics.*``, ``track(``, ``log(``. The interaction
+          is not expected to mutate the rendered tree.
+        * ``None``  — handler text was not available (passed by
+          identifier we couldn't resolve, imported, computed) or the
+          body is ambiguous. The UI probe degrades to heuristic
+          confidence in this case.
+    """
+    if handler_body is None:
+        return None
+    body = handler_body
+    if _SET_CALL_RE.search(body) or _DISPATCH_RE.search(body):
+        return True
+    # Side-effect-only signatures. Require at least one recognised call
+    # AND no recognised state mutator (already short-circuited above).
+    side_effect_only = re.search(
+        r"\b(?:console\.(?:log|info|warn|error|debug)|analytics\.|track|log)\s*\(",
+        body,
+    )
+    has_fetch = re.search(r"\bfetch\s*\(", body)
+    # ``fetch(...).then(set...)`` would already have matched _SET_CALL_RE
+    # above. A bare fetch with no observable follow-up is side-effect.
+    if side_effect_only and not _SET_CALL_RE.search(body):
+        return False
+    if has_fetch and not _SET_CALL_RE.search(body):
+        return False
+    return None
+
+
+def _index_named_handlers(root: ts.Node) -> dict[str, str]:
+    """Map identifier -> handler body source for top-level handlers.
+
+    Recognises ``function foo() { ... }``, ``const foo = () => { ... }``,
+    and ``const foo = function() { ... }``. Best-effort; nested closures
+    inside hooks (``const foo = useCallback(() => ...)``) are not
+    indexed in v0 — they fall through to ``None``.
+    """
+    out: dict[str, str] = {}
+    for node in _walk(root):
+        if node.type == "function_declaration":
+            name_node = node.child_by_field_name("name")
+            body_node = node.child_by_field_name("body")
+            if name_node is not None and body_node is not None:
+                out[_text(name_node)] = _text(body_node)
+        elif node.type == "variable_declarator":
+            name_node = node.child_by_field_name("name")
+            value_node = node.child_by_field_name("value")
+            if (
+                name_node is not None
+                and value_node is not None
+                and value_node.type in {"arrow_function", "function_expression"}
+            ):
+                body_node = value_node.child_by_field_name("body")
+                if body_node is not None:
+                    out[_text(name_node)] = _text(body_node)
+    return out
+
+
+def _resolve_handler_body(
+    expr: ts.Node, named: dict[str, str]
+) -> str | None:
+    """Return the text of a JSX handler expression's body.
+
+    * ``onClick={() => setX(1)}`` -> ``"setX(1)"`` (the arrow body)
+    * ``onClick={handleSave}``    -> the body of ``handleSave`` if
+      indexed, else ``None``.
+    * ``onClick={this.save}`` / ``onClick={obj.method}`` -> ``None``.
+    """
+    if expr.type in {"arrow_function", "function_expression"}:
+        body = expr.child_by_field_name("body")
+        return _text(body) if body is not None else None
+    if expr.type == "identifier":
+        return named.get(_text(expr))
+    return None
+
 
 
 def _jsx_text_content(element: ts.Node) -> str:

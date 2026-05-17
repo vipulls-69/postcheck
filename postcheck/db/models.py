@@ -173,7 +173,16 @@ class Bug(SQLModel, table=True):
     probe: str = Field(sa_column=Column(String, nullable=False))
     route: str = Field(sa_column=Column(String, nullable=False))
     interaction_summary: str = Field(sa_column=Column(String, nullable=False))
-    error_message: str = Field(sa_column=Column(String, nullable=False))
+    # ``title`` is the one-line headline (e.g. ``"Network error: GET
+    # /api/x → 500"``); ``detail`` is the multi-line body (stack trace,
+    # error context). Together they replace the v0-pre-Phase-F
+    # ``error_message`` column, which conflated headline and body into a
+    # single field that produced unreadable rows in both the CLI table
+    # output and the future API. ``detail`` may be empty (some kinds
+    # have no body beyond the title), but ``title`` is always set —
+    # bug_aggregator's recipe table guarantees a non-empty headline.
+    title: str = Field(sa_column=Column(String, nullable=False))
+    detail: str = Field(sa_column=Column(String, nullable=False, default=""))
     suspected_file: str | None = Field(default=None, sa_column=Column(String, nullable=True))
     suspected_line: int | None = Field(default=None, nullable=True)
     confidence: BugConfidence = Field(sa_column=Column(String, nullable=False))

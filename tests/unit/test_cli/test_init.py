@@ -47,11 +47,11 @@ def test_init_in_empty_dir_succeeds(tmp_path: Path) -> None:
     assert db_path.is_file()
 
     config = json.loads(config_path.read_text())
-    assert config["launch_mode"] == "launch"
-    assert config["launch_headless"] is True
-    assert config["adapter"] == "auto"
-    assert config["timeout_ms"] == 30_000
-    assert config["base_url"] == "http://localhost:5173"
+    # New behavior: init writes only project-layer overrides. Empty project with
+    # no global config and a non-default base_url => just base_url is persisted.
+    assert config == {"base_url": "http://localhost:5173"}
+    # README scaffolded.
+    assert (postcheck_dir / "README.md").is_file()
 
     # Default org + Project rows seeded.
     conn = sqlite3.connect(db_path)

@@ -103,7 +103,8 @@ def seeded_project(tmp_path: Path) -> tuple[Path, list[UUID]]:
                                     "probe": "runtime",
                                     "route": "/cart",
                                     "confidence": "deterministic",
-                                    "error_message": "boom",
+                                    "title": "boom",
+                                    "detail": "",
                                 }
                             ],
                         )

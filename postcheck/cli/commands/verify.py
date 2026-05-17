@@ -85,9 +85,6 @@ def _bug_to_row(bug: CoreBug) -> dict[str, Any]:
     if bug.interaction is not None:
         target = bug.interaction.target_label or ""
         interaction_summary = f"{bug.interaction.kind} {target}".strip()
-    error_message = bug.title
-    if bug.detail:
-        error_message = f"{bug.title}: {bug.detail}"
     suspected_file: str | None = None
     suspected_line: int | None = None
     if bug.suspected_location is not None:
@@ -97,7 +94,8 @@ def _bug_to_row(bug: CoreBug) -> dict[str, Any]:
         "probe": bug.probe,
         "route": bug.route,
         "interaction_summary": interaction_summary,
-        "error_message": error_message,
+        "title": bug.title,
+        "detail": bug.detail or "",
         "suspected_file": suspected_file,
         "suspected_line": suspected_line,
         "confidence": bug.confidence,

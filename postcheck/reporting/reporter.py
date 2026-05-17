@@ -203,7 +203,14 @@ def _render_bug(bug: Bug) -> list[str]:
         )
     if bug.detail:
         for line in bug.detail.splitlines():
-            out.append(f"  - {line}" if line.strip() else "  -")
+            # Skip whitespace-only lines outright — rendering them as
+            # ``"  -"`` produces orphan bullet rows in the Markdown
+            # output, which the no-empty-lines regression test in
+            # ``tests/unit/test_reporting/test_reporter.py`` forbids.
+            stripped = line.strip()
+            if not stripped:
+                continue
+            out.append(f"  - {stripped}")
     return out
 
 
